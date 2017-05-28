@@ -9,6 +9,7 @@ const googleAuth = require('google-auth-library');
 const GoogleStrategy = require('passport-google-oauth').OAuth2Strategy;
 const axios = require('axios');
 const uuidV4 = require('uuid/v4');
+const db = require('./db');
 
 app.use(require('morgan')('dev'));
 
@@ -22,6 +23,7 @@ passport.deserializeUser(function(obj, cb) {
   cb(null, obj);
 });
 
+app.use(bodyParser.json());
 app.use(require('express-session')({
   secret: config.secret,
   resave: true,
@@ -41,9 +43,7 @@ passport.use(new GoogleStrategy({
     process.nextTick(function() {
       localStorage.accessToken = accessToken;
       localStorage.refreshToken = refreshToken;
-      localStorage.email = profile.emails.value;
-      // console.log('profile', profile);
-      console.log('local storage', localStorage);
+      localStorage.email = profile.emails[0].value;
       return done(null, profile);
     });
   }
@@ -63,61 +63,110 @@ app.get('/', function (req, res) {
 });
 
 app.get('/calendar-events', checkAuthentication, (req, res) => {
-  // res.send('calendar-events');
-  var auth = new googleAuth();
-  var oauth2Client = new auth.OAuth2(config.clientID, config.clientSecret, 'http://localhost:3007/auth/google/callback');
-  oauth2Client.credentials = {
-    access_token: localStorage.accessToken,
-    refresh_token: localStorage.refreshToken
-  };
-  // console.log(oauth2Client);
-  var calendar = google.calendar('v3');
-  calendar.events.list({
-    auth: oauth2Client,
-    calendarId: 'b.lh.wong@gmail.com' //TO DO CHANGE
-    // timeMin: (new Date()).toISOString(),
-    // maxResults: 10,
-    // singleEvents: true,
-    // orderBy: 'startTime'
-  }, function(err, response) {
-    if (err) {
-      console.log('The API returned an error: ' + err);
-      // return;
-      // res.sendStatus(400);
+  db.User.findOne({email: localStorage.email})
+  .then((user) => {
+    if (!user) {
+    //get list from api
+      var auth = new googleAuth();
+      var oauth2Client = new auth.OAuth2(config.clientID, config.clientSecret, 'http://localhost:3007/auth/google/callback');
+      oauth2Client.credentials = {
+        access_token: localStorage.accessToken,
+        refresh_token: localStorage.refreshToken
+      };
+      var calendar = google.calendar('v3');
+      calendar.events.list({
+        auth: oauth2Client,
+        calendarId: localStorage.email,
+        timeMin: (new Date()).toISOString(),
+        singleEvents: true,
+        orderBy: 'startTime'
+      }, function(err, response) {
+        if (err) {
+          console.log('The API returned an error: ' + err);
+          res.sendStatus(400); //error getting data from api
+        }
+        // create webhook
+        calendar.events.watch({
+          auth: oauth2Client,
+          calendarId: 'primary',
+          resource: {
+            address: `${config.address}/notification`,
+            id: uuidV4(),
+            kind: 'api#channel',
+            type: 'web_hook'
+          }
+        }, {}, (err, watchResponse) => {
+          if (err) {
+            res.sendStatus(400); // error creating webhook
+          }
+          let user = new db.User({
+            email: localStorage.email,
+            response: JSON.stringify(response),
+            watch: JSON.stringify(watchResponse),
+            uuid: watchResponse.id,
+            accessToken: localStorage.accessToken
+          });
+          user.save((err) => {
+            if (err) {
+              res.sendStatus(400); // error saving to db
+            }
+            //response from the api
+            console.log('response from the api');
+            res.send(response);
+          });
+        });
+      });
+    } else {
+      // response from the db
+      console.log('response from the db');
+      res.send(JSON.parse(user.response));
+
     }
-    // console.log('response', response);
-    let request = calendar.events.watch({
-      auth: oauth2Client,
-      calendarId: 'primary',
-      resource: {
-        address: 'https://e5f045bd.ngrok.io/notification',
-        id: uuidV4(),
-        kind: 'api#channel',
-        // resourceId: ,
-        // resourceUri: ,
-        type: 'web_hook'
-      }
-    }, {}, (err, watchResponse) => {
-      console.log(err, watchResponse);
-    });
-    console.log('request', request);
-    res.send(response);
-    // var events = response.items;
-    // if (events.length == 0) {
-    //   console.log('No upcoming events found.');
-    // } else {
-    //   console.log('Upcoming 10 events:');
-    //   for (var i = 0; i < events.length; i++) {
-    //     var event = events[i];
-    //     var start = event.start.dateTime || event.start.date;
-    //     console.log('%s - %s', start, event.summary);
-    //   }
-    // }
+
+  }).catch((err) => {
+    res.sendStatus(500).send(err);
   });
+
 });
 
 app.post('/notification', (req, res) => {
-  console.log('inside notification', req, res);
+  let id = req.headers['x-goog-channel-id'];
+  db.User.findOne({uuid: id})
+  .then((user) => {
+    if (!user) {
+      res.sendStatus(404);
+    } else {
+      // get new listing
+      var auth = new googleAuth();
+        var oauth2Client = new auth.OAuth2(config.clientID, config.clientSecret, 'http://localhost:3007/auth/google/callback');
+        oauth2Client.credentials = {
+          access_token: user.accessToken,
+        };
+        var calendar = google.calendar('v3');
+        calendar.events.list({
+          auth: oauth2Client,
+          calendarId: user.email,
+          timeMin: (new Date()).toISOString(),
+          singleEvents: true,
+          orderBy: 'startTime'
+        }, function(err, response) {
+          if (err) {
+            res.sendStatus(400); // error getting new listings
+          } else {
+            user.response = JSON.stringify(response);
+            user.save((err) => {
+              if (err) {
+                res.sendStatus(500).send(err); // error saving to db
+              } else {
+                console.log('Successfully updated from webhook');
+                res.sendStatus(201); // successfully updated from webhook
+
+              }
+            });
+          }
+        });
+    }
+  });
 });
 
 app.get('/auth/google',
